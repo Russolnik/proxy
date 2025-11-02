@@ -26,9 +26,11 @@ WS_PORT=8765
 
 ### 3. Настройки сервиса
 
-- **Build Command:** `pip install -r requirements.txt`
-- **Start Command:** `python app.py`
+- **Environment:** `Python 3` ⚠️ **ВАЖНО:** Должен быть Python, не Node.js!
+- **Build Command:** `pip install --upgrade pip && pip install -r requirements.txt`
+- **Start Command:** `python3 app.py` (или `python app.py`)
 - **Python Version:** 3.13.0 (или совместимая)
+- **Root Directory:** `proxy-server` (если папка в подпапке репозитория)
 
 ### 4. После деплоя
 
