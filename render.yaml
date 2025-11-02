@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: websocket-proxy
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: HTTP_PROXY
+        sync: false
+      - key: HTTPS_PROXY
+        sync: false
+      - key: PROXY_URL
+        sync: false
+      - key: PORT
+        value: 5000
+      - key: WS_PORT
+        value: 8765
+
