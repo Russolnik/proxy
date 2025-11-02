@@ -66,11 +66,10 @@ def get_proxy_config():
 def create_google_connection(client_id: str, api_key: str):
     """
     Создает соединение к Google API через HTTP прокси
-    Запускается в отдельном потоке для каждого клиента
+    Запускается в отдельном greenlet для каждого клиента через eventlet
     """
     try:
         proxy_config = get_proxy_config()
-        headers = {"x-goog-api-key": api_key}
         google_ws_url = f"{GEMINI_WS_URL}?key={api_key}"
         
         # Устанавливаем прокси если есть
@@ -83,49 +82,15 @@ def create_google_connection(client_id: str, api_key: str):
             logger.info(f"Подключение через прокси {proxy_config['host']}:{proxy_config['port']}")
         
         try:
-            # Создаем event loop в новом потоке
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # ВАЖНО: eventlet уже запускает event loop, не создаем новый
+            # Используем eventlet.spawn для запуска асинхронного кода в greenlet
             
-            # Создаем соединение к Google
             async def connect_and_forward():
                 try:
-                    # ПРОБЛЕМА: websockets.connect() с extra_headers не работает с eventlet/asyncio
-                    # РЕШЕНИЕ: API ключ уже передается через query параметр ?key=api_key в URL
-                    # Дополнительный заголовок x-goog-api-key не нужен, так как ключ в URL
-                    # Если Google API требует заголовок, используем подкласс WebSocketClientProtocol
-                    
-                    try:
-                        # Пробуем подключиться без extra_headers (ключ уже в URL)
-                        google_ws = await websockets.connect(google_ws_url)
-                    except Exception as e1:
-                        logger.warning(f"Ошибка подключения без заголовков: {e1}, пробую с подклассом")
-                        # Если не работает, пробуем создать кастомный протокол
-                        from websockets.client import WebSocketClientProtocol
-                        
-                        class HeaderWebSocketProtocol(WebSocketClientProtocol):
-                            """WebSocket протокол с поддержкой дополнительных заголовков"""
-                            def __init__(self, *args, custom_headers=None, **kwargs):
-                                self.custom_headers = custom_headers or {}
-                                super().__init__(*args, **kwargs)
-                            
-                            async def handshake(self, *args, **kwargs):
-                                # Добавляем заголовки во время handshake
-                                if self.custom_headers:
-                                    for key, value in self.custom_headers.items():
-                                        self.request_headers[key] = value
-                                return await super().handshake(*args, **kwargs)
-                        
-                        try:
-                            # Используем кастомный протокол с заголовками
-                            google_ws = await websockets.connect(
-                                google_ws_url,
-                                create_protocol=lambda: HeaderWebSocketProtocol(custom_headers=headers)
-                            )
-                        except Exception as e2:
-                            logger.error(f"Ошибка подключения с кастомным протоколом: {e2}")
-                            raise e2
-                    
+                    # Подключаемся к Google WebSocket API
+                    # API ключ уже в URL через ?key=api_key, дополнительный заголовок не нужен
+                    logger.info(f"Подключение к Google API: {google_ws_url[:80]}...")
+                    google_ws = await websockets.connect(google_ws_url)
                     google_connections[client_id] = google_ws
                     logger.info(f"✅ Соединение с Google API установлено для {client_id}")
                     
@@ -161,8 +126,29 @@ def create_google_connection(client_id: str, api_key: str):
                     if client_id in google_connections:
                         del google_connections[client_id]
             
-            # Запускаем в event loop
-            loop.run_until_complete(connect_and_forward())
+            # ВАЖНО: eventlet уже запускает event loop через monkey patching
+            # Используем eventlet.spawn для запуска async функции в greenlet
+            # НО asyncio.run() не работает внутри eventlet, нужно использовать get_event_loop()
+            
+            def run_async_in_eventlet():
+                """Запускает async функцию внутри eventlet greenlet"""
+                try:
+                    # Пробуем получить существующий event loop от eventlet
+                    try:
+                        loop = asyncio.get_event_loop()
+                    except RuntimeError:
+                        # Если нет event loop, создаем новый в этом greenlet
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                    
+                    # Запускаем async функцию
+                    loop.run_until_complete(connect_and_forward())
+                except Exception as e:
+                    logger.error(f"Ошибка в run_async_in_eventlet: {e}", exc_info=True)
+                    socketio.emit('error', {'message': str(e)}, room=client_id)
+            
+            # Запускаем в отдельном greenlet
+            eventlet.spawn_n(run_async_in_eventlet)
             
         finally:
             # Восстанавливаем переменные окружения
@@ -192,13 +178,9 @@ def handle_connect(auth):
     if api_key:
         client_api_keys[client_id] = api_key
         logger.info(f"API ключ получен для {client_id}: {api_key[:10]}...")
-        # Создаем соединение к Google в отдельном потоке
-        thread = threading.Thread(
-            target=create_google_connection,
-            args=(client_id, api_key),
-            daemon=True
-        )
-        thread.start()
+        # Создаем соединение к Google в отдельном greenlet через eventlet
+        # НЕ используем threading.Thread, т.к. eventlet лучше работает с greenlets
+        eventlet.spawn_n(create_google_connection, client_id, api_key)
     
     emit('connected', {'status': 'connected', 'client_id': client_id})
 
@@ -212,14 +194,18 @@ def handle_disconnect():
     if client_id in google_connections:
         try:
             google_ws = google_connections[client_id]
-            # Закрываем в отдельном потоке
+            # Закрываем в отдельном greenlet через eventlet
             def close_connection():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(google_ws.close())
-                loop.close()
-            thread = threading.Thread(target=close_connection, daemon=True)
-            thread.start()
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(google_ws.close())
+                except:
+                    pass
+            eventlet.spawn_n(close_connection)
         except:
             pass
         del google_connections[client_id]
@@ -242,12 +228,7 @@ def handle_message(data):
         # Проверяем наличие соединения к Google
         if client_id not in google_connections:
             logger.warning(f"Соединение к Google не создано для {client_id}, создаю...")
-            thread = threading.Thread(
-                target=create_google_connection,
-                args=(client_id, api_key),
-                daemon=True
-            )
-            thread.start()
+            eventlet.spawn_n(create_google_connection, client_id, api_key)
             emit('info', {'message': 'Connecting to Google...'}, room=client_id)
             return
         
@@ -255,8 +236,11 @@ def handle_message(data):
         def send_to_google():
             try:
                 google_ws = google_connections[client_id]
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                 
                 async def send():
                     try:
@@ -276,8 +260,7 @@ def handle_message(data):
                 logger.error(f"Ошибка при отправке к Google: {e}", exc_info=True)
                 socketio.emit('error', {'message': str(e)}, room=client_id)
         
-        thread = threading.Thread(target=send_to_google, daemon=True)
-        thread.start()
+        eventlet.spawn_n(send_to_google)
         
     except Exception as e:
         logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
@@ -297,13 +280,8 @@ def handle_init(data):
         client_api_keys[client_id] = api_key
         logger.info(f"Инициализировано соединение {client_id} с API ключом: {api_key[:10]}...")
         
-        # Создаем соединение к Google
-        thread = threading.Thread(
-            target=create_google_connection,
-            args=(client_id, api_key),
-            daemon=True
-        )
-        thread.start()
+        # Создаем соединение к Google в отдельном greenlet
+        eventlet.spawn_n(create_google_connection, client_id, api_key)
         
         emit('initialized', {'status': 'ok', 'client_id': client_id})
         
