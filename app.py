@@ -172,7 +172,24 @@ def create_google_connection(client_id: str, api_key: str):
                             del google_connections[client_id]
                 
                 # Запускаем async функцию
-                loop.run_until_complete(connect_and_forward())
+                # ВАЖНО: gevent monkey patching может конфликтовать с asyncio
+                # Используем nest_asyncio для совместимости
+                try:
+                    import nest_asyncio
+                    nest_asyncio.apply(loop)
+                    loop.run_until_complete(connect_and_forward())
+                except ImportError:
+                    # Если nest_asyncio не установлен, пробуем без него
+                    # Это может не сработать с gevent
+                    try:
+                        loop.run_until_complete(connect_and_forward())
+                    except RuntimeError as e:
+                        if "cannot be called from a running event loop" in str(e):
+                            # Если loop уже запущен, используем asyncio.run в отдельном процессе
+                            logger.error(f"Конфликт event loop: {e}. Используйте threading.Thread вместо gevent для asyncio операций.")
+                            raise
+                        else:
+                            raise
             except Exception as e:
                 logger.error(f"Ошибка в run_async_in_thread: {e}", exc_info=True)
                 socketio.emit('error', {'message': str(e)}, room=client_id)
