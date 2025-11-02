@@ -17,9 +17,8 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
-
-# ВАЖНО: НЕ используем eventlet.monkey_patch() при async_mode='threading'
-# eventlet несовместим с asyncio
+from gevent import monkey
+monkey.patch_all()  # Патчим для совместимости с asyncio и threading
 
 # Настройка логирования
 logging.basicConfig(
@@ -36,8 +35,9 @@ app = Flask(__name__)
 CORS(app)  # Разрешаем CORS для всех доменов
 
 # Инициализация SocketIO
-# Используем threading вместо eventlet для совместимости с asyncio
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', logger=True, engineio_logger=True)
+# Используем gevent для production (лучше чем threading для WebSocket)
+# gevent совместим с asyncio через monkey patching
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent', logger=True, engineio_logger=True)
 
 # Хранилище активных WebSocket соединений к Google
 google_connections = {}
@@ -357,15 +357,35 @@ def run_server():
     logger.info("📡 WebSocket доступен через Socket.IO: /socket.io/")
     logger.info("💡 Клиент должен использовать Socket.IO библиотеку для подключения")
     
-    # Запускаем Flask с SocketIO через threading
-    socketio.run(
-        app,
-        host='0.0.0.0',
-        port=flask_port,
-        debug=False,
-        use_reloader=False,
-        log_output=True
-    )
+    # Для production используем gunicorn (через Procfile или render.yaml)
+    # Для разработки можно использовать socketio.run с allow_unsafe_werkzeug
+    is_production = os.getenv('RENDER') is not None or os.getenv('DYNO') is not None
+    
+    if is_production:
+        # В production должен использоваться gunicorn через Procfile/render.yaml
+        # socketio.run не подходит для production
+        logger.warning("⚠️ Production режим: используйте gunicorn через Procfile/render.yaml")
+        # Временное решение для Render - разрешаем werkzeug с предупреждением
+        socketio.run(
+            app,
+            host='0.0.0.0',
+            port=flask_port,
+            debug=False,
+            use_reloader=False,
+            log_output=True,
+            allow_unsafe_werkzeug=True  # Только для Render, не для реального production
+        )
+    else:
+        # Разработка
+        socketio.run(
+            app,
+            host='0.0.0.0',
+            port=flask_port,
+            debug=False,
+            use_reloader=False,
+            log_output=True,
+            allow_unsafe_werkzeug=True
+        )
 
 if __name__ == "__main__":
     run_server()

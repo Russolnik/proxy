@@ -3,7 +3,7 @@ services:
     name: websocket-proxy
     env: python
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: python3 app.py
+    startCommand: gunicorn --worker-class gevent --worker-connections 1000 --bind 0.0.0.0:$PORT --timeout 120 --config gunicorn_config.py app:app
     plan: free  # или starter для платного
     envVars:
       - key: HTTP_PROXY
