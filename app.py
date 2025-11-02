@@ -111,11 +111,8 @@ def create_google_connection(client_id: str, api_key: str):
                                 os.environ['HTTP_PROXY'] = proxy_config['url']
                                 os.environ['HTTPS_PROXY'] = proxy_config['url']
                                 
-                                # Пробуем подключиться (отключаем timeout чтобы избежать конфликта с gevent)
-                                google_ws = await websockets.connect(
-                                    google_ws_url,
-                                    timeout=None  # Отключаем встроенный timeout чтобы избежать конфликта с gevent
-                                )
+                                # Пробуем подключиться (без timeout параметра)
+                                google_ws = await websockets.connect(google_ws_url)
                                 logger.info(f"✅ Подключение через прокси успешно (маловероятно для WebSocket)")
                             except Exception as proxy_error:
                                 logger.error(f"❌ Ошибка через HTTP прокси: {proxy_error}")
@@ -132,10 +129,7 @@ def create_google_connection(client_id: str, api_key: str):
                                     del os.environ['HTTPS_PROXY']
                                 
                                 # Прямое подключение (Render сервер находится вне РФ/Беларуси, поэтому доступен)
-                                google_ws = await websockets.connect(
-                                    google_ws_url,
-                                    timeout=None  # Отключаем встроенный timeout
-                                )
+                                google_ws = await websockets.connect(google_ws_url)
                             finally:
                                 # Финальное восстановление переменных окружения
                                 if original_http_proxy and os.environ.get('HTTP_PROXY') == proxy_config['url']:
@@ -147,16 +141,20 @@ def create_google_connection(client_id: str, api_key: str):
                                 elif 'HTTPS_PROXY' in os.environ and os.environ['HTTPS_PROXY'] == proxy_config['url']:
                                     del os.environ['HTTPS_PROXY']
                         else:
-                            # Прямое подключение без прокси (отключаем timeout)
-                            google_ws = await websockets.connect(
-                                google_ws_url,
-                                timeout=None  # Отключаем встроенный timeout чтобы избежать конфликта с gevent
-                            )
+                            # Прямое подключение без прокси
+                            google_ws = await websockets.connect(google_ws_url)
                         
                         google_connections[client_id] = google_ws
                         logger.info(f"✅ Соединение с Google API установлено для {client_id}")
                         
-                        # Запускаем задачу для чтения от Google
+                        # Убираем флаг попытки подключения после успешного подключения
+                        if client_id in _connection_attempts:
+                            del _connection_attempts[client_id]
+                        
+                        # Отправляем событие об успешном подключении к Google
+                        socketio.emit('info', {'message': 'Connected to Google API'}, room=client_id)
+                        
+                        # Запускаем задачу для чтения от Google в фоне
                         async def read_from_google():
                             try:
                                 async for message in google_ws:
@@ -170,6 +168,9 @@ def create_google_connection(client_id: str, api_key: str):
                                 logger.info(f"Соединение с Google закрыто для {client_id}")
                                 if client_id in google_connections:
                                     del google_connections[client_id]
+                                # Убираем флаг попытки подключения
+                                if client_id in _connection_attempts:
+                                    del _connection_attempts[client_id]
                             except Exception as e:
                                 logger.error(f"Ошибка при чтении от Google: {e}", exc_info=True)
                                 if client_id in google_connections:
@@ -178,9 +179,19 @@ def create_google_connection(client_id: str, api_key: str):
                                     except:
                                         pass
                                     del google_connections[client_id]
+                                # Убираем флаг попытки подключения при ошибке
+                                if client_id in _connection_attempts:
+                                    del _connection_attempts[client_id]
                         
-                        # Запускаем чтение
-                        await read_from_google()
+                        # Запускаем чтение как фоновую задачу (не блокируем)
+                        task = loop.create_task(read_from_google())
+                        
+                        # Не ждем завершения - чтение работает в фоне
+                        logger.info(f"Задача чтения от Google запущена для {client_id} (работает в фоне)")
+                        
+                        # Ждем завершения задачи чтения (она работает пока соединение активно)
+                        # Это нужно чтобы event loop продолжал работать
+                        await task
                         
                     except Exception as e:
                         logger.error(f"Ошибка подключения к Google: {e}", exc_info=True)
