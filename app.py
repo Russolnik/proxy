@@ -43,6 +43,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent', logger=T
 # Хранилище активных WebSocket соединений к Google
 google_connections = {}
 client_api_keys = {}  # Хранилище API ключей для каждого клиента
+_connection_attempts = {}  # Флаг для отслеживания попыток подключения (избегаем множественных попыток)
 
 def get_proxy_config():
     """Получает конфигурацию прокси из переменных окружения"""
@@ -69,6 +70,13 @@ def create_google_connection(client_id: str, api_key: str):
     Создает соединение к Google API через HTTP прокси
     Запускается в отдельном потоке для каждого клиента
     """
+    # Проверяем, не идет ли уже подключение для этого клиента
+    if client_id in _connection_attempts:
+        logger.warning(f"Подключение к Google уже выполняется для {client_id}, пропускаю...")
+        return
+    
+    _connection_attempts[client_id] = True
+    
     try:
         proxy_config = get_proxy_config()
         google_ws_url = f"{GEMINI_WS_URL}?key={api_key}"
@@ -103,8 +111,11 @@ def create_google_connection(client_id: str, api_key: str):
                                 os.environ['HTTP_PROXY'] = proxy_config['url']
                                 os.environ['HTTPS_PROXY'] = proxy_config['url']
                                 
-                                # Пробуем подключиться
-                                google_ws = await websockets.connect(google_ws_url)
+                                # Пробуем подключиться (отключаем timeout чтобы избежать конфликта с gevent)
+                                google_ws = await websockets.connect(
+                                    google_ws_url,
+                                    timeout=None  # Отключаем встроенный timeout чтобы избежать конфликта с gevent
+                                )
                                 logger.info(f"✅ Подключение через прокси успешно (маловероятно для WebSocket)")
                             except Exception as proxy_error:
                                 logger.error(f"❌ Ошибка через HTTP прокси: {proxy_error}")
@@ -121,7 +132,10 @@ def create_google_connection(client_id: str, api_key: str):
                                     del os.environ['HTTPS_PROXY']
                                 
                                 # Прямое подключение (Render сервер находится вне РФ/Беларуси, поэтому доступен)
-                                google_ws = await websockets.connect(google_ws_url)
+                                google_ws = await websockets.connect(
+                                    google_ws_url,
+                                    timeout=None  # Отключаем встроенный timeout
+                                )
                             finally:
                                 # Финальное восстановление переменных окружения
                                 if original_http_proxy and os.environ.get('HTTP_PROXY') == proxy_config['url']:
@@ -133,8 +147,11 @@ def create_google_connection(client_id: str, api_key: str):
                                 elif 'HTTPS_PROXY' in os.environ and os.environ['HTTPS_PROXY'] == proxy_config['url']:
                                     del os.environ['HTTPS_PROXY']
                         else:
-                            # Прямое подключение без прокси
-                            google_ws = await websockets.connect(google_ws_url)
+                            # Прямое подключение без прокси (отключаем timeout)
+                            google_ws = await websockets.connect(
+                                google_ws_url,
+                                timeout=None  # Отключаем встроенный timeout чтобы избежать конфликта с gevent
+                            )
                         
                         google_connections[client_id] = google_ws
                         logger.info(f"✅ Соединение с Google API установлено для {client_id}")
@@ -170,6 +187,9 @@ def create_google_connection(client_id: str, api_key: str):
                         socketio.emit('error', {'message': str(e)}, room=client_id)
                         if client_id in google_connections:
                             del google_connections[client_id]
+                        # Убираем флаг попытки подключения при ошибке
+                        if client_id in _connection_attempts:
+                            del _connection_attempts[client_id]
                 
                 # Запускаем async функцию
                 # ВАЖНО: gevent monkey patching конфликтует с asyncio
@@ -198,7 +218,13 @@ def create_google_connection(client_id: str, api_key: str):
             except Exception as e:
                 logger.error(f"Ошибка в run_async_in_thread: {e}", exc_info=True)
                 socketio.emit('error', {'message': str(e)}, room=client_id)
+                # Убираем флаг попытки подключения при ошибке
+                if client_id in _connection_attempts:
+                    del _connection_attempts[client_id]
             finally:
+                # Убираем флаг попытки подключения
+                if client_id in _connection_attempts:
+                    del _connection_attempts[client_id]
                 try:
                     loop.close()
                 except:
@@ -211,6 +237,9 @@ def create_google_connection(client_id: str, api_key: str):
     except Exception as e:
         logger.error(f"Ошибка создания соединения к Google: {e}", exc_info=True)
         socketio.emit('error', {'message': str(e)}, room=client_id)
+        # Убираем флаг попытки подключения при ошибке
+        if client_id in _connection_attempts:
+            del _connection_attempts[client_id]
 
 # SocketIO события
 @socketio.on('connect')
@@ -274,9 +303,11 @@ def handle_message(data):
         
         # Проверяем наличие соединения к Google
         if client_id not in google_connections:
-            logger.warning(f"Соединение к Google не создано для {client_id}, создаю...")
-            gevent.spawn(create_google_connection, client_id, api_key)
-            emit('info', {'message': 'Connecting to Google...'}, room=client_id)
+            # Создаем соединение только если его еще нет и нет активной попытки
+            if client_id not in _connection_attempts:
+                logger.warning(f"Соединение к Google не создано для {client_id}, создаю...")
+                gevent.spawn(create_google_connection, client_id, api_key)
+                emit('info', {'message': 'Connecting to Google...'}, room=client_id)
             return
         
         # Отправляем сообщение к Google
