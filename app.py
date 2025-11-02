@@ -319,6 +319,9 @@ def handle_message(data):
                 logger.warning(f"Соединение к Google не создано для {client_id}, создаю...")
                 gevent.spawn(create_google_connection, client_id, api_key)
                 emit('info', {'message': 'Connecting to Google...'}, room=client_id)
+            # НЕ возвращаемся - ждем пока соединение установится, но не спамим сообщениями
+            # Вместо этого просто не отправляем данные пока соединение не готово
+            logger.info(f"Ожидаю установки соединения к Google для {client_id}...")
             return
         
         # Отправляем сообщение к Google
@@ -383,9 +386,12 @@ def handle_init(data):
         client_api_keys[client_id] = api_key
         logger.info(f"Инициализировано соединение {client_id} с API ключом: {api_key[:10]}...")
         
-        # Создаем соединение к Google в отдельном greenlet
-        # Используем gevent для запуска функции (gevent уже импортирован)
-        gevent.spawn(create_google_connection, client_id, api_key)
+        # Создаем соединение к Google в отдельном greenlet ТОЛЬКО если его еще нет
+        if client_id not in google_connections and client_id not in _connection_attempts:
+            logger.info(f"Создаю соединение к Google для {client_id}...")
+            gevent.spawn(create_google_connection, client_id, api_key)
+        else:
+            logger.info(f"Соединение к Google уже создается или создано для {client_id}")
         
         emit('initialized', {'status': 'ok', 'client_id': client_id})
         
