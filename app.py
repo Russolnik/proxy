@@ -283,11 +283,15 @@ def handle_message(data):
         def send_to_google():
             try:
                 google_ws = google_connections[client_id]
+                # Создаем новый event loop для этого потока
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
                 try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
+                    import nest_asyncio
+                    nest_asyncio.apply(loop)
+                except ImportError:
+                    pass  # nest_asyncio опционально
                 
                 async def send():
                     try:
@@ -302,13 +306,22 @@ def handle_message(data):
                         logger.error(f"Ошибка отправки к Google: {e}", exc_info=True)
                         socketio.emit('error', {'message': str(e)}, room=client_id)
                 
-                loop.run_until_complete(send())
+                try:
+                    loop.run_until_complete(send())
+                except Exception as e:
+                    logger.error(f"Ошибка в event loop: {e}", exc_info=True)
+                    socketio.emit('error', {'message': str(e)}, room=client_id)
+                finally:
+                    try:
+                        loop.close()
+                    except:
+                        pass
             except Exception as e:
                 logger.error(f"Ошибка при отправке к Google: {e}", exc_info=True)
                 socketio.emit('error', {'message': str(e)}, room=client_id)
         
-            thread = threading.Thread(target=send_to_google, daemon=True)
-            thread.start()
+        thread = threading.Thread(target=send_to_google, daemon=True)
+        thread.start()
         
     except Exception as e:
         logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
