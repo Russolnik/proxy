@@ -2,6 +2,9 @@
 WebSocket прокси сервер для Google Gemini Live API
 Проксирует WebSocket соединения от клиента к Google API через HTTP прокси
 Развертывается на Render как отдельный сервис
+
+ВАЖНО: Использует Flask-SocketIO для работы WebSocket на том же порту что и Flask
+Это необходимо для Render, который предоставляет только один порт
 """
 
 import os
@@ -9,9 +12,15 @@ import asyncio
 import websockets
 import json
 import logging
+import threading
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
+import eventlet
+
+# Патчим eventlet для поддержки asyncio
+eventlet.monkey_patch()
 
 # Настройка логирования
 logging.basicConfig(
@@ -27,8 +36,12 @@ GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generative
 app = Flask(__name__)
 CORS(app)  # Разрешаем CORS для всех доменов
 
-# Хранилище активных WebSocket соединений
-active_connections = {}
+# Инициализация SocketIO
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', logger=True, engineio_logger=True)
+
+# Хранилище активных WebSocket соединений к Google
+google_connections = {}
+client_api_keys = {}  # Хранилище API ключей для каждого клиента
 
 def get_proxy_config():
     """Получает конфигурацию прокси из переменных окружения"""
@@ -50,170 +63,218 @@ def get_proxy_config():
         logger.error(f"Ошибка парсинга прокси URL: {e}")
         return None
 
-async def proxy_websocket(client_ws, api_key: str):
+def create_google_connection(client_id: str, api_key: str):
     """
-    Проксирует WebSocket соединение от клиента к Google API через HTTP прокси
-    
-    Args:
-        client_ws: WebSocket соединение от клиента
-        api_key: API ключ Google Gemini
+    Создает соединение к Google API через HTTP прокси
+    Запускается в отдельном потоке для каждого клиента
     """
-    google_ws = None
     try:
-        # Получаем конфигурацию прокси
         proxy_config = get_proxy_config()
-        
-        # Создаем WebSocket соединение к Google API
-        headers = {
-            "x-goog-api-key": api_key,
-        }
-        
+        headers = {"x-goog-api-key": api_key}
         google_ws_url = f"{GEMINI_WS_URL}?key={api_key}"
         
-        # Подключение через прокси (если настроен)
+        # Устанавливаем прокси если есть
+        original_http_proxy = os.environ.get('HTTP_PROXY')
+        original_https_proxy = os.environ.get('HTTPS_PROXY')
+        
         if proxy_config:
-            logger.info(f"🔗 Подключение к Google API WebSocket через прокси {proxy_config['host']}:{proxy_config['port']}...")
-            
-            # Устанавливаем переменные окружения для прокси
-            # websockets библиотека может использовать их через httpx/proxy-сервер
-            original_http_proxy = os.environ.get('HTTP_PROXY')
-            original_https_proxy = os.environ.get('HTTPS_PROXY')
-            
             os.environ['HTTP_PROXY'] = proxy_config['url']
             os.environ['HTTPS_PROXY'] = proxy_config['url']
-            
-            try:
-                # ВАЖНО: Стандартная websockets библиотека не поддерживает HTTP прокси напрямую
-                # Используем библиотеку, которая поддерживает прокси, или обходной путь
-                # Пока используем подключение напрямую - прокси должен быть на уровне системы/сервера
-                
-                logger.info("⚠️ Стандартная websockets не поддерживает HTTP прокси напрямую")
-                logger.info("💡 Прокси должен быть настроен на уровне системы или использовать SOCKS прокси")
-                
-                async with websockets.connect(
-                    google_ws_url, 
-                    extra_headers=headers,
-                ) as google_ws:
-                    logger.info("✅ Подключено к Google API WebSocket")
-                    await handle_websocket_messages(client_ws, google_ws)
-                    
-            except Exception as proxy_error:
-                logger.error(f"❌ Ошибка подключения: {proxy_error}")
-                raise
-            finally:
-                # Восстанавливаем переменные окружения
-                if original_http_proxy:
-                    os.environ['HTTP_PROXY'] = original_http_proxy
-                elif 'HTTP_PROXY' in os.environ:
-                    del os.environ['HTTP_PROXY']
-                    
-                if original_https_proxy:
-                    os.environ['HTTPS_PROXY'] = original_https_proxy
-                elif 'HTTPS_PROXY' in os.environ:
-                    del os.environ['HTTPS_PROXY']
-        else:
-            logger.info("Подключение к Google API WebSocket напрямую (прокси не настроен)...")
-            async with websockets.connect(google_ws_url, extra_headers=headers) as google_ws:
-                logger.info("✅ Подключено к Google API WebSocket")
-                await handle_websocket_messages(client_ws, google_ws)
-            
-    except Exception as e:
-        logger.error(f"Ошибка в proxy_websocket: {e}", exc_info=True)
+            logger.info(f"Подключение через прокси {proxy_config['host']}:{proxy_config['port']}")
+        
         try:
-            await client_ws.close(code=1011, reason=f"Proxy error: {str(e)}")
+            # Создаем event loop в новом потоке
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Создаем соединение к Google
+            async def connect_and_forward():
+                try:
+                    google_ws = await websockets.connect(google_ws_url, extra_headers=headers)
+                    google_connections[client_id] = google_ws
+                    logger.info(f"✅ Соединение с Google API установлено для {client_id}")
+                    
+                    # Запускаем задачу для чтения от Google
+                    async def read_from_google():
+                        try:
+                            async for message in google_ws:
+                                # Отправляем клиенту через SocketIO
+                                socketio.emit('gemini_message', {
+                                    'data': message.decode('utf-8') if isinstance(message, bytes) else message,
+                                    'type': 'text' if isinstance(message, str) else 'binary'
+                                }, room=client_id)
+                                logger.debug(f"Получено сообщение от Google для {client_id}")
+                        except websockets.exceptions.ConnectionClosed:
+                            logger.info(f"Соединение с Google закрыто для {client_id}")
+                            if client_id in google_connections:
+                                del google_connections[client_id]
+                        except Exception as e:
+                            logger.error(f"Ошибка при чтении от Google: {e}", exc_info=True)
+                            if client_id in google_connections:
+                                try:
+                                    await google_connections[client_id].close()
+                                except:
+                                    pass
+                                del google_connections[client_id]
+                    
+                    # Запускаем чтение
+                    await read_from_google()
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка подключения к Google: {e}", exc_info=True)
+                    socketio.emit('error', {'message': str(e)}, room=client_id)
+                    if client_id in google_connections:
+                        del google_connections[client_id]
+            
+            # Запускаем в event loop
+            loop.run_until_complete(connect_and_forward())
+            
+        finally:
+            # Восстанавливаем переменные окружения
+            if original_http_proxy:
+                os.environ['HTTP_PROXY'] = original_http_proxy
+            elif 'HTTP_PROXY' in os.environ:
+                del os.environ['HTTP_PROXY']
+            if original_https_proxy:
+                os.environ['HTTPS_PROXY'] = original_https_proxy
+            elif 'HTTPS_PROXY' in os.environ:
+                del os.environ['HTTPS_PROXY']
+                
+    except Exception as e:
+        logger.error(f"Ошибка создания соединения к Google: {e}", exc_info=True)
+        socketio.emit('error', {'message': str(e)}, room=client_id)
+
+# SocketIO события
+@socketio.on('connect')
+def handle_connect(auth):
+    """Обработчик подключения WebSocket клиента"""
+    client_id = request.sid
+    logger.info(f"WebSocket клиент подключился: {client_id}")
+    
+    # Получаем API ключ из query параметров или auth
+    api_key = request.args.get('api_key') or (auth.get('api_key') if auth else None)
+    
+    if api_key:
+        client_api_keys[client_id] = api_key
+        logger.info(f"API ключ получен для {client_id}: {api_key[:10]}...")
+        # Создаем соединение к Google в отдельном потоке
+        thread = threading.Thread(
+            target=create_google_connection,
+            args=(client_id, api_key),
+            daemon=True
+        )
+        thread.start()
+    
+    emit('connected', {'status': 'connected', 'client_id': client_id})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Обработчик отключения WebSocket клиента"""
+    client_id = request.sid
+    logger.info(f"WebSocket клиент отключился: {client_id}")
+    
+    # Закрываем соединение с Google
+    if client_id in google_connections:
+        try:
+            google_ws = google_connections[client_id]
+            # Закрываем в отдельном потоке
+            def close_connection():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(google_ws.close())
+                loop.close()
+            thread = threading.Thread(target=close_connection, daemon=True)
+            thread.start()
         except:
             pass
-
-async def handle_websocket_messages(client_ws, google_ws):
-    """Обрабатывает двунаправленную передачу сообщений между клиентом и Google"""
-    # Запускаем две задачи для двунаправленной передачи данных
-    async def client_to_google():
-        try:
-            async for message in client_ws:
-                # Пересылаем сообщение от клиента к Google
-                await google_ws.send(message)
-                logger.debug(f"Отправлено клиенту->Google: {len(message)} байт")
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("Клиент отключился")
-        except Exception as e:
-            logger.error(f"Ошибка в client_to_google: {e}", exc_info=True)
+        del google_connections[client_id]
     
-    async def google_to_client():
-        try:
-            async for message in google_ws:
-                # Пересылаем сообщение от Google к клиенту
-                await client_ws.send(message)
-                logger.debug(f"Отправлено Google->клиенту: {len(message)} байт")
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("Google API отключился")
-        except Exception as e:
-            logger.error(f"Ошибка в google_to_client: {e}", exc_info=True)
-    
-    # Ждем завершения обеих задач
-    await asyncio.gather(
-        client_to_google(),
-        google_to_client(),
-        return_exceptions=True
-    )
+    if client_id in client_api_keys:
+        del client_api_keys[client_id]
 
-async def handle_websocket_proxy(websocket, path):
-    """
-    Обработчик WebSocket соединения от клиента
-    """
-    connection_id = None
+@socketio.on('message')
+def handle_message(data):
+    """Обработчик сообщений от WebSocket клиента"""
     try:
-        # Получаем API ключ из query параметров или первого сообщения
-        query_params = path.split('?')[1] if '?' in path else ''
-        api_key = None
-        
-        if query_params:
-            from urllib.parse import parse_qs
-            params = parse_qs(query_params)
-            api_key = params.get('api_key', [None])[0]
+        client_id = request.sid
+        api_key = client_api_keys.get(client_id)
         
         if not api_key:
-            # Ждем первое сообщение с API ключом
-            first_message = await websocket.recv()
+            emit('error', {'message': 'API key required. Send it in connect query or init event'}, room=client_id)
+            logger.warning(f"API ключ не найден для {client_id}")
+            return
+        
+        # Проверяем наличие соединения к Google
+        if client_id not in google_connections:
+            logger.warning(f"Соединение к Google не создано для {client_id}, создаю...")
+            thread = threading.Thread(
+                target=create_google_connection,
+                args=(client_id, api_key),
+                daemon=True
+            )
+            thread.start()
+            emit('info', {'message': 'Connecting to Google...'}, room=client_id)
+            return
+        
+        # Отправляем сообщение к Google
+        def send_to_google():
             try:
-                data = json.loads(first_message)
-                api_key = data.get('api_key')
-            except:
-                await websocket.close(code=1008, reason="API key required")
-                return
+                google_ws = google_connections[client_id]
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                async def send():
+                    try:
+                        if isinstance(data, str):
+                            await google_ws.send(data)
+                        elif isinstance(data, dict):
+                            await google_ws.send(json.dumps(data))
+                        else:
+                            await google_ws.send(data)
+                        logger.debug(f"Отправлено сообщение от {client_id} к Google")
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки к Google: {e}", exc_info=True)
+                        socketio.emit('error', {'message': str(e)}, room=client_id)
+                
+                loop.run_until_complete(send())
+            except Exception as e:
+                logger.error(f"Ошибка при отправке к Google: {e}", exc_info=True)
+                socketio.emit('error', {'message': str(e)}, room=client_id)
         
-        connection_id = f"{id(websocket)}"
-        active_connections[connection_id] = websocket
+        thread = threading.Thread(target=send_to_google, daemon=True)
+        thread.start()
         
-        logger.info(f"Начало проксирования WebSocket для API ключа: {api_key[:10]}... (connection: {connection_id})")
-        await proxy_websocket(websocket, api_key)
-        
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"WebSocket соединение закрыто (connection: {connection_id})")
     except Exception as e:
-        logger.error(f"Ошибка в handle_websocket_proxy: {e}", exc_info=True)
-    finally:
-        if connection_id and connection_id in active_connections:
-            del active_connections[connection_id]
+        logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
+        emit('error', {'message': str(e)}, room=request.sid)
 
-async def start_websocket_server(port: int = 8765):
-    """
-    Запускает WebSocket прокси сервер
-    
-    Args:
-        port: Порт для WebSocket сервера
-    """
-    proxy_config = get_proxy_config()
-    if proxy_config:
-        logger.info(f"✅ HTTP прокси настроен: {proxy_config['host']}:{proxy_config['port']}")
-        logger.warning("⚠️ ВНИМАНИЕ: Стандартная библиотека websockets может не поддерживать HTTP прокси")
-        logger.info("💡 Для работы через HTTP прокси рекомендуется использовать SOCKS5 прокси или прокси на уровне системы")
-    else:
-        logger.info("⚠️ HTTP прокси не настроен, подключение будет прямым")
-    
-    logger.info(f"Запуск WebSocket прокси сервера на порту {port}...")
-    async with websockets.serve(handle_websocket_proxy, "0.0.0.0", port):
-        logger.info(f"✅ WebSocket прокси сервер запущен на ws://0.0.0.0:{port}")
-        await asyncio.Future()  # Запускаем бесконечно
+@socketio.on('init')
+def handle_init(data):
+    """Инициализация соединения с API ключом"""
+    try:
+        client_id = request.sid
+        api_key = data.get('api_key') or data.get('apiKey')
+        
+        if not api_key:
+            emit('error', {'message': 'API key required'}, room=client_id)
+            return
+        
+        client_api_keys[client_id] = api_key
+        logger.info(f"Инициализировано соединение {client_id} с API ключом: {api_key[:10]}...")
+        
+        # Создаем соединение к Google
+        thread = threading.Thread(
+            target=create_google_connection,
+            args=(client_id, api_key),
+            daemon=True
+        )
+        thread.start()
+        
+        emit('initialized', {'status': 'ok', 'client_id': client_id})
+        
+    except Exception as e:
+        logger.error(f"Ошибка инициализации: {e}", exc_info=True)
+        emit('error', {'message': str(e)}, room=request.sid)
 
 # Flask routes
 @app.route("/")
@@ -225,7 +286,9 @@ def home():
         "status": "running",
         "proxy": "configured" if proxy_config else "not configured",
         "proxy_host": f"{proxy_config['host']}:{proxy_config['port']}" if proxy_config else None,
-        "websocket_endpoint": "/api/gemini/ws-proxy",
+        "websocket_endpoint": "/socket.io/",
+        "info_endpoint": "/api/gemini/ws-proxy-info",
+        "connection_method": "Socket.IO",
     })
 
 @app.route("/health")
@@ -247,12 +310,13 @@ def api_ws_proxy_info():
         
         # Получаем базовый URL
         base_url = request.url_root.rstrip('/')
-        ws_proxy_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://') + '/api/gemini/ws-proxy'
+        ws_proxy_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://') + '/socket.io/'
         
         return jsonify({
             "ws_proxy_url": ws_proxy_url,
             "api_key_masked": api_key[:10] + "..." if len(api_key) > 10 else "***",
             "proxy_configured": get_proxy_config() is not None,
+            "connection_method": "Socket.IO",
         }), 200
         
     except Exception as e:
@@ -260,21 +324,28 @@ def api_ws_proxy_info():
         return jsonify({"error": str(e)}), 500
 
 def run_server():
-    """Запускает Flask сервер и WebSocket сервер"""
-    import threading
-    
-    # Запускаем WebSocket сервер в отдельном потоке
-    ws_port = int(os.getenv('WS_PORT', '8765'))
-    ws_thread = threading.Thread(
-        target=lambda: asyncio.run(start_websocket_server(port=ws_port)),
-        daemon=True
-    )
-    ws_thread.start()
-    
-    # Запускаем Flask сервер
+    """Запускает Flask сервер с SocketIO"""
     flask_port = int(os.getenv('PORT', '5000'))
-    app.run(host='0.0.0.0', port=flask_port, debug=False)
+    
+    proxy_config = get_proxy_config()
+    if proxy_config:
+        logger.info(f"✅ HTTP прокси настроен: {proxy_config['host']}:{proxy_config['port']}")
+    else:
+        logger.warning("⚠️ HTTP прокси не настроен, подключение будет прямым")
+    
+    logger.info(f"Запуск Flask сервера с SocketIO на порту {flask_port}...")
+    logger.info("📡 WebSocket доступен через Socket.IO: /socket.io/")
+    logger.info("💡 Клиент должен использовать Socket.IO библиотеку для подключения")
+    
+    # Запускаем Flask с SocketIO через eventlet
+    socketio.run(
+        app,
+        host='0.0.0.0',
+        port=flask_port,
+        debug=False,
+        use_reloader=False,
+        log_output=True
+    )
 
 if __name__ == "__main__":
     run_server()
-
