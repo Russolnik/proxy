@@ -1,0 +1,10 @@
+{
+  "name": "websocket-proxy",
+  "version": "1.0.0",
+  "description": "WebSocket proxy server for Google Gemini Live API",
+  "private": true,
+  "scripts": {
+    "start": "python app.py"
+  }
+}
+

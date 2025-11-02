@@ -4,6 +4,7 @@ services:
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
+    plan: free  # или starter для платного
     envVars:
       - key: HTTP_PROXY
         sync: false
